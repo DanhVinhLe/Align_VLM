@@ -7,7 +7,6 @@ from mobilevlm.model.vision_projector import build_vision_projector
 from mobilevlm.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, \
     DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 
-
 class MobileVLMMetaModel:
 
     def __init__(self, config):
@@ -84,8 +83,9 @@ class MobileVLMMetaForCausalLM(ABC):
         return self.get_model().get_vision_tower()
 
     def encode_images(self, images):
-        image_features = self.get_model().get_vision_tower()(images)
-        image_features = self.get_model().mm_projector(image_features)
+        # for different encoder, the images should be prepared into different shape
+        image_features = self.get_model().get_vision_tower()(images) 
+        image_features = self.get_model().mm_projector(image_features) # 1, 144, 2048
         return image_features
 
     def prepare_inputs_labels_for_multimodal(
@@ -104,12 +104,13 @@ class MobileVLMMetaForCausalLM(ABC):
             image_features = torch.split(image_features, split_sizes, dim=0)
             image_features = [x.flatten(0, 1) for x in image_features]
         else:
-            image_features = self.encode_images(images)
+            image_features = self.encode_images(images) # output of encoder
 
         new_input_embeds = []
         new_labels = [] if labels is not None else None
         cur_image_idx = 0
         for batch_idx, cur_input_ids in enumerate(input_ids):
+            # IMAGE_TOKEN_INDEX -200
             if (cur_input_ids == IMAGE_TOKEN_INDEX).sum() == 0:
                 # multimodal LLM, but the current sample is not multimodal
                 # FIXME: this is a hacky fix, for deepspeed zero3 to work
@@ -123,7 +124,7 @@ class MobileVLMMetaForCausalLM(ABC):
                     new_labels.append(labels[batch_idx])
                 cur_image_idx += 1
                 continue
-            image_token_indices = torch.where(cur_input_ids == IMAGE_TOKEN_INDEX)[0]
+            image_token_indices = torch.where(cur_input_ids == IMAGE_TOKEN_INDEX)[0] #1
             cur_new_input_embeds = []
             if labels is not None:
                 cur_labels = labels[batch_idx]
@@ -169,7 +170,9 @@ class MobileVLMMetaForCausalLM(ABC):
                 cur_new_labels = torch.cat(cur_new_labels, dim=0)
                 new_labels.append(cur_new_labels)
 
+        text_mask,vision_mask=None,None
         if any(x.shape != new_input_embeds[0].shape for x in new_input_embeds):
+            print("Forward with padding for different lengths of input_embeds.")
             max_len = max(x.shape[0] for x in new_input_embeds)
 
             new_input_embeds_align = []
@@ -196,16 +199,28 @@ class MobileVLMMetaForCausalLM(ABC):
                 attention_mask = torch.stack(new_attention_mask, dim=0)
                 assert attention_mask.shape == new_labels.shape
         else:
+            print("Forward without padding for same lengths of input_embeds.")
             new_input_embeds = torch.stack(new_input_embeds, dim=0)
             if labels is not None:
                 new_labels  = torch.stack(new_labels, dim=0)
 
             if attention_mask is not None:
                 new_attn_mask_pad_left = torch.full((attention_mask.shape[0], new_input_embeds.shape[1] - input_ids.shape[1]), True, dtype=attention_mask.dtype, device=attention_mask.device)
+                vision_mask = torch.full((attention_mask.shape[0], new_input_embeds.shape[1] - attention_mask.shape[1] + 2), True, dtype=attention_mask.dtype, device=attention_mask.device)
+                text_mask = torch.cat((vision_mask==False, attention_mask[:,2:]),dim=1)
+                text_padding = torch.full((attention_mask.shape[0], new_input_embeds.shape[1] - vision_mask.shape[1]), False, dtype=attention_mask.dtype, device=attention_mask.device)
+                vision_mask = torch.cat((vision_mask,text_padding),dim=1)
+                if getattr(self.config, 'tune_mm_mlp_adapter', False) and getattr(self.config, 'mm_use_im_start_end', False):
+                    vision_mask[:,:2] = False
+                else:
+                    vision_mask[:,0] = False
                 attention_mask = torch.cat((new_attn_mask_pad_left, attention_mask), dim=1)
                 assert attention_mask.shape == new_input_embeds.shape[:2]
-
-        return None, attention_mask, past_key_values, new_input_embeds, new_labels
+                del text_padding
+                del new_attn_mask_pad_left
+        torch.cuda.empty_cache()
+                
+        return None, attention_mask, past_key_values, new_input_embeds, new_labels, image_features, (text_mask, vision_mask)
 
     def initialize_vision_tokenizer(self, model_args, tokenizer):
         if model_args.mm_use_im_patch_token:
@@ -296,3 +311,35 @@ def load_pretrained_model(model_path, load_8bit=False, load_4bit=False, device_m
         context_len = 2048
     
     return tokenizer, model, image_processor, context_len
+
+def load_pretrained_model_processor(model_path, load_8bit=False, load_4bit=False, device_map="auto", device="cuda"):
+
+    from mobilevlm.model.mobilellama import MobileLlamaForCausalLM
+
+    kwargs = {"device_map": device_map}
+
+    if load_8bit:
+        kwargs['load_in_8bit'] = True
+    elif load_4bit:
+        kwargs['load_in_4bit'] = True
+        kwargs['quantization_config'] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type='nf4'
+        )
+    else:
+        kwargs['torch_dtype'] = torch.float16
+
+    model = MobileLlamaForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, **kwargs)
+
+    vision_tower = model.get_vision_tower()
+    if 'v2' in getattr(model.config, "mm_projector_type", "ldpnet"):
+        vision_tower.load_image_processor()
+    elif not vision_tower.is_loaded:
+        vision_tower.load_model()
+        
+    vision_tower.to(device=device, dtype=torch.float16)
+    image_processor = vision_tower.image_processor
+    
+    return model, image_processor

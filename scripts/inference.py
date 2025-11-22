@@ -17,7 +17,7 @@ def inference_once(args):
     disable_torch_init()
     model_name = args.model_path.split('/')[-1]
     tokenizer, model, image_processor, context_len = load_pretrained_model(args.model_path, args.load_8bit, args.load_4bit)
-
+    
     images = [Image.open(args.image_file).convert("RGB")]
     images_tensor = process_images(images, image_processor, model.config).to(model.device, dtype=torch.float16)
 
@@ -29,29 +29,35 @@ def inference_once(args):
     # Input
     input_ids = (tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt").unsqueeze(0).cuda())
     stopping_criteria = KeywordsStoppingCriteria([stop_str], tokenizer, input_ids)
+    attention_mask = torch.ones_like(input_ids)
     # Inference
     with torch.inference_mode():
-        output_ids = model.generate(
-            input_ids,
-            images=images_tensor,
-            do_sample=True if args.temperature > 0 else False,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            num_beams=args.num_beams,
-            max_new_tokens=args.max_new_tokens,
-            use_cache=True,
-            stopping_criteria=[stopping_criteria],
-        )
+        # output_ids = model.generate(
+        #     input_ids,
+        #     images=images_tensor,
+        #     do_sample=True if args.temperature > 0 else False,
+        #     temperature=args.temperature,
+        #     top_p=args.top_p,
+        #     num_beams=args.num_beams,
+        #     max_new_tokens=args.max_new_tokens,
+        #     use_cache=True,
+        #     stopping_criteria=[stopping_criteria],
+        # )
+        out = model(input_ids=input_ids, attention_mask=attention_mask, images=images_tensor, use_cache=False, output_hidden_states=True, return_dict=True)
+        
     # Result-Decode
-    input_token_len = input_ids.shape[1]
-    n_diff_input_output = (input_ids != output_ids[:, :input_token_len]).sum().item()
-    if n_diff_input_output > 0:
-        print(f"[Warning] {n_diff_input_output} output_ids are not the same as the input_ids")
-    outputs = tokenizer.batch_decode(output_ids[:, input_token_len:], skip_special_tokens=True)[0]
-    outputs = outputs.strip()
-    if outputs.endswith(stop_str):
-        outputs = outputs[: -len(stop_str)]
-    print(f"🚀 {model_name}: {outputs.strip()}\n")
+    
+    # print(f"Output ids: {output_ids}")
+    # print(f"Input ids: {input_ids}")
+    # input_token_len = input_ids.shape[1]
+    # n_diff_input_output = (input_ids != output_ids[:, :input_token_len]).sum().item()
+    # if n_diff_input_output > 0:
+    #     print(f"[Warning] {n_diff_input_output} output_ids are not the same as the input_ids")
+    # outputs = tokenizer.batch_decode(output_ids[:, input_token_len:], skip_special_tokens=True)[0]
+    # outputs = outputs.strip()
+    # if outputs.endswith(stop_str):
+    #     outputs = outputs[: -len(stop_str)]
+    # print(f"🚀 {model_name}: {outputs.strip()}\n")
 
 
 if __name__ == "__main__":

@@ -6,12 +6,20 @@ from transformers.trainer import (ALL_LAYERNORM_LAYERS, ShardedDDPOption,
                                   get_parameter_names, has_length,
                                   is_sagemaker_mp_enabled, logger)
 from transformers.utils import is_sagemaker_mp_enabled, is_apex_available
+import torch.nn.functional as F
+from transformers.trainer_pt_utils import OSS
+from transformers.modeling_utils import unwrap_model
+from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
+
 if is_sagemaker_mp_enabled():
     from transformers.trainer_pt_utils import smp_forward_backward
-if is_apex_available():
-    from apex import amp
-
-
+try:
+    if is_apex_available():
+        from apex import amp
+except ImportError:
+    pass
+import os
+        
 def split_to_even_chunks(indices, lengths, num_chunks):
     """
     Split a list of indices into `chunks` chunks of roughly equal lengths.
@@ -110,9 +118,32 @@ class LengthGroupedSampler(Sampler):
             indices = get_length_grouped_indices(self.lengths, self.batch_size, self.world_size, generator=self.generator)
         return iter(indices)
 
-
+    
 class VLMTrainer(Trainer):
-
+    def __init__(self,
+        model = None,
+        teacher = None,
+        args = None,
+        data_collator = None,
+        train_dataset = None,
+        eval_dataset = None,
+        tokenizer = None,
+        model_init = None,
+        compute_metrics = None,
+        callbacks = None,
+        optimizers = (None, None),
+        preprocess_logits_for_metrics = None,
+        ):
+        super(VLMTrainer, self).__init__(model, args, data_collator, train_dataset, eval_dataset, tokenizer, model_init, compute_metrics, callbacks, optimizers, preprocess_logits_for_metrics)
+        if args.distill==1:
+            self.teacher = teacher
+            self.attn_adapter = torch.nn.Sequential(
+                torch.nn.Conv2d(32,16,1),
+            ).to(device=teacher.device,dtype=teacher.dtype).train()
+            self.proj_adapter = torch.nn.Sequential(
+                torch.nn.Conv1d(4096,2048,1),
+            ).to(device=teacher.device,dtype=teacher.dtype).train()
+        
     def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
         if self.train_dataset is None or not has_length(self.train_dataset):
             return None
@@ -231,7 +262,6 @@ class VLMTrainer(Trainer):
 
         return self.optimizer
 
-
     def training_step(self, model, inputs):
         """
         Perform a training step on a batch of inputs.
@@ -250,19 +280,23 @@ class VLMTrainer(Trainer):
         Return:
             `torch.Tensor`: The tensor with training loss on this batch.
         """
+        torch.cuda.empty_cache()
         model.train()
+        
+        idx = inputs.pop('idx')
         inputs = self._prepare_inputs(inputs)
-
+        inputs['idx']=idx
+        
         if is_sagemaker_mp_enabled():
             loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps)
             return loss_mb.reduce_mean().detach().to(self.args.device)
-
+        
         with self.compute_loss_context_manager():
             loss = self.compute_loss(model, inputs)
 
         if self.args.n_gpu > 1:
             loss = loss.mean()
-
+        torch.cuda.empty_cache()
         if self.do_grad_scaling:
             self.scaler.scale(loss).backward()
         elif self.use_apex:
@@ -270,5 +304,96 @@ class VLMTrainer(Trainer):
                 scaled_loss.backward()
         else:
             self.accelerator.backward(loss)
+        torch.cuda.empty_cache()
 
         return loss.detach() / self.args.gradient_accumulation_steps
+    
+    def get_distil_loss(self, logits, teacher_logits):
+        teacher_probs = F.softmax(teacher_logits, dim=-1, dtype=torch.float16) #
+        inf_mask = torch.isinf(logits)
+        logprobs = F.log_softmax(logits, dim=-1, dtype=torch.float16) 
+        prod_probs = torch.masked_fill(teacher_probs * logprobs, inf_mask, 0)
+        x = torch.sum(prod_probs, dim=-1).view(-1)
+        distil_loss = -torch.mean(x, dim=0)
+        
+        return distil_loss
+
+    def get_v_loss(self, teacher_front_attn, t_v_mask, v_feature, teacher_v_feature, k=16):
+        t_v_mask = t_v_mask[:,0,:,:]
+        teacher_front_attn = teacher_front_attn.mean(1)
+        top_attn, top_idx = teacher_front_attn.sum(-2).topk(k,dim=-1)
+        if t_v_mask.sum(-2)[0,1]==True:
+            top_idx = top_idx - 1
+        else:
+            top_idx = top_idx - 2
+        batch_idx = torch.arange(top_idx.shape[0]).unsqueeze(-1).repeat(1,top_idx.shape[-1]).flatten()
+        top_idx = top_idx.flatten()
+        v_feature_pick = v_feature[batch_idx,top_idx]
+        teacher_v_feature_pick = teacher_v_feature[batch_idx,top_idx]
+        v_loss = ((self.proj_adapter(teacher_v_feature_pick.unsqueeze(1).permute(0,2,1)) - v_feature_pick.unsqueeze(1).permute(0,2,1))**2).mean()
+        v_loss_all = ((self.proj_adapter(teacher_v_feature.permute(0,2,1))-v_feature.permute(0,2,1))**2).mean()
+        v_loss = v_loss + v_loss_all
+        
+        return v_loss
+    
+    def compute_loss(self, model, inputs, return_outputs=False):
+        """
+        How the loss is computed by Trainer. By default, all models return the loss in the first element.
+
+        Subclass and override for custom behavior.
+        """
+        if self.label_smoother is not None and "labels" in inputs:
+            labels = inputs.pop("labels")
+        else:
+            labels = None
+        
+        idx = inputs.pop('idx')
+        if len(idx)==0:
+            idx = None
+        else:
+            idx = idx[0]
+        outputs, v_feature, front_attn, t_v_mask = model(**inputs) # dict loss, logits, hidden_states=None, attention=None  
+        if self.args.distill == 1 and idx is not None:
+            with torch.no_grad():
+                teacher_outputs, teacher_v_feature, teacher_front_attn, _ = self.teacher(**inputs)
+                teacher_logits = teacher_outputs['logits']
+                teacher_front_attn = teacher_front_attn
+                
+
+        # Save past state if it exists
+        # TODO: this needs to be fixed and made cleaner later.
+        if self.args.past_index >= 0:
+            self._past = outputs[self.args.past_index]
+
+        if labels is not None:
+            if unwrap_model(model)._get_name() in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.values():
+                loss = self.label_smoother(outputs, labels, shift_labels=True)
+            else:
+                loss = self.label_smoother(outputs, labels)
+        else:
+            if isinstance(outputs, dict) and "loss" not in outputs:
+                raise ValueError(
+                    "The model did not return a loss from the inputs, only the following keys: "
+                    f"{','.join(outputs.keys())}. For reference, the inputs it received are {','.join(inputs.keys())}."
+                )
+            # We don't use .loss here since the model may return tuples instead of ModelOutput.
+            loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+            if t_v_mask is None:
+                return (loss,outputs) if return_outputs else loss
+            if idx is None:
+                print('skip')
+                return (loss*0.0001,outputs) if return_outputs else loss*0.0001
+            
+            # distil
+            if self.args.distill == 1:
+                v_logits_distill = 1 * self.get_distil_loss(outputs['logits'],teacher_logits)
+                if teacher_front_attn.shape[-1]<144: # samples with no image
+                    v_loss = ((self.proj_adapter(teacher_v_feature.permute(0,2,1))-v_feature.permute(0,2,1))**2).mean()
+                else:
+                    v_loss = self.get_v_loss(teacher_front_attn, t_v_mask, v_feature, teacher_v_feature)
+                attn_loss = ((self.attn_adapter(teacher_front_attn) - front_attn)[t_v_mask!=0]**2).mean()
+
+                loss = loss + v_logits_distill + v_loss + attn_loss
+            torch.cuda.empty_cache()
+
+        return (loss, outputs) if return_outputs else loss

@@ -14,8 +14,20 @@ from mobilevlm.train.trainer import VLMTrainer
 from mobilevlm import conversation as conversation_lib
 from mobilevlm.model.mobilellama import MobileLlamaForCausalLM
 from mobilevlm.utils import tokenizer_image_token
+from mobilevlm.model.mobilevlm import load_pretrained_model
+import random
+import numpy as np
 
 local_rank = None
+
+def seed(seed=0):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
 
 
 def rank0_print(*args):
@@ -83,7 +95,8 @@ class TrainingArguments(transformers.TrainingArguments):
     lora_bias: str = "none"
     mm_projector_lr: Optional[float] = None
     group_by_modality_length: bool = field(default=False)
-
+    distill: int = 0
+    task: str = field(default="pretrain")
 
 def maybe_zero_3(param, ignore_status=False, name=None):
     from deepspeed import zero
@@ -196,7 +209,6 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
         del state_dict
         trainer._save(output_dir, state_dict=cpu_state_dict)  # noqa
 
-
 def smart_tokenizer_and_embedding_resize(
     special_tokens_dict: Dict,
     tokenizer: transformers.PreTrainedTokenizer,
@@ -302,7 +314,6 @@ def preprocess_multimodal(
             sentence["value"] = sentence["value"].replace(DEFAULT_IMAGE_TOKEN, replace_token)
 
     return sources
-
 
 def preprocess_llama_2(
     sources,
@@ -613,8 +624,13 @@ class LazySupervisedDataset(Dataset):
 
         rank0_print("Formatting inputs...Skip in lazy mode")
         self.tokenizer = tokenizer
-        self.list_data_dict = list_data_dict
+        # self.list_data_dict = list_data_dict
         self.data_args = data_args
+        self.list_data_dict = [
+            s for s in list_data_dict 
+            if ('image' not in s) or os.path.exists(os.path.join(self.data_args.image_folder, s['image']))
+        ]
+        
 
     def __len__(self):
         return len(self.list_data_dict)
@@ -645,6 +661,7 @@ class LazySupervisedDataset(Dataset):
             image_file = self.list_data_dict[i]['image']
             image_folder = self.data_args.image_folder
             processor = self.data_args.image_processor
+            # teacher_processor = self.data_args.teacher_image_processor
             image = Image.open(os.path.join(image_folder, image_file)).convert('RGB')
             if self.data_args.image_aspect_ratio == 'pad':
                 def expand2square(pil_img, background_color):
@@ -660,8 +677,10 @@ class LazySupervisedDataset(Dataset):
                         result.paste(pil_img, ((height - width) // 2, 0))
                         return result
                 image = expand2square(image, tuple(int(x*255) for x in processor.image_mean))
+                # teacher_image = teacher_processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
                 image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
             else:
+                # teacher_image = teacher_processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
                 image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
             sources = preprocess_multimodal(
                 copy.deepcopy([e["conversations"] for e in sources]), self.data_args)
@@ -678,10 +697,16 @@ class LazySupervisedDataset(Dataset):
         # image exist in the data
         if 'image' in self.list_data_dict[i]:
             data_dict['image'] = image
+            # data_dict['teacher_image'] = teacher_image
         elif self.data_args.is_multimodal:
             # image does not exist in the data, but the model is multimodal
             crop_size = self.data_args.image_processor.crop_size
             data_dict['image'] = torch.zeros(3, crop_size['height'], crop_size['width'])
+            # data_dict['teacher_image'] = torch.zeros(3, crop_size['height'], crop_size['width'])
+        data_dict['idx'] = self.list_data_dict[i]['id']
+        data_dict['overlen']=0
+        if data_dict['input_ids'].shape[0]>2048:
+            data_dict['overlen']=1
         return data_dict
 
 
@@ -692,8 +717,11 @@ class DataCollatorForSupervisedDataset(object):
     tokenizer: transformers.PreTrainedTokenizer
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
-        input_ids, labels = tuple([instance[key] for instance in instances]
-                                  for key in ("input_ids", "labels"))
+        idx, input_ids, labels = tuple([instance[key] for instance in instances if instance['overlen']!=1]
+                                  for key in ("idx", "input_ids", "labels"))
+        if len(input_ids)==0:
+            input_ids = [instances[0]['input_ids']]
+            labels = [instances[0]['labels']]
         input_ids = torch.nn.utils.rnn.pad_sequence(
             input_ids,
             batch_first=True,
@@ -706,15 +734,20 @@ class DataCollatorForSupervisedDataset(object):
         batch = dict(
             input_ids=input_ids,
             labels=labels,
-            attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
+            attention_mask=input_ids.ne(self.tokenizer.pad_token_id), idx=idx,
         )
 
         if 'image' in instances[0]:
-            images = [instance['image'] for instance in instances]
+            images = [instance['image'] for instance in instances if instance['overlen']!=1]
+            if len(images)==0:
+                images = [instances[0]['image']]
+            # teacher_images = [instance['teacher_image'] for instance in instances]
             if all(x is not None and x.shape == images[0].shape for x in images):
                 batch['images'] = torch.stack(images)
+                # batch['teacher_images'] = torch.stack(teacher_images)
             else:
                 batch['images'] = images
+                # batch['teacher_images'] = teacher_images
 
         return batch
 
@@ -732,13 +765,14 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
 
 
 def train():
+    seed()
     global local_rank
 
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
     local_rank = training_args.local_rank
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
-
+    
     bnb_model_from_pretrained_args = {}
     if training_args.bits in [4, 8]:
         from transformers import BitsAndBytesConfig
@@ -769,7 +803,17 @@ def train():
                 cache_dir=training_args.cache_dir,
                 **bnb_model_from_pretrained_args
             )
-    else:
+
+            if training_args.distill==1:
+                # teacher_image_processor = load_pretrained_model('/home/ma-user/work/fengqianhan/MobileVLM-main/mtgv/MobileVLM_V2-1.7B')[2]
+                teacher = MobileLlamaForCausalLM.from_pretrained(
+                    'mtgv/MobileVLM_V2-7B',
+                    cache_dir=training_args.cache_dir,
+                    **bnb_model_from_pretrained_args
+                ).to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
+                teacher.config.use_cache = False
+
+    else: # skip
         model = transformers.LlamaForCausalLM.from_pretrained(
             model_args.model_name_or_path,
             cache_dir=training_args.cache_dir,
@@ -777,15 +821,17 @@ def train():
         )
     model.config.use_cache = False
 
-    if model_args.freeze_backbone:
+    if model_args.freeze_backbone: # skip
         model.model.requires_grad_(False)
-
-    if training_args.bits in [4, 8]:
+    if training_args.distill==1:
+        teacher.model.requires_grad_(False)
+    
+    if training_args.bits in [4, 8]: # skip
         from peft import prepare_model_for_kbit_training
         model.config.torch_dtype=(torch.float32 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
         model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=training_args.gradient_checkpointing)
 
-    if training_args.gradient_checkpointing:
+    if training_args.gradient_checkpointing: # skip
         if hasattr(model, "enable_input_require_grads"):
             model.enable_input_require_grads()
         else:
@@ -793,7 +839,7 @@ def train():
                 output.requires_grad_(True)
             model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
 
-    if training_args.lora_enable:
+    if training_args.lora_enable: # skip
         from peft import LoraConfig, get_peft_model
         lora_config = LoraConfig(
             r=training_args.lora_r,
@@ -811,7 +857,7 @@ def train():
         rank0_print("Adding LoRA adapters...")
         model = get_peft_model(model, lora_config)
 
-    if 'mpt' in model_args.model_name_or_path:
+    if 'mpt' in model_args.model_name_or_path: # skip
         tokenizer = transformers.AutoTokenizer.from_pretrained(
             model_args.model_name_or_path,
             cache_dir=training_args.cache_dir,
@@ -824,23 +870,23 @@ def train():
             cache_dir=training_args.cache_dir,
             model_max_length=training_args.model_max_length,
             padding_side="right",
-            use_fast=False,
+            use_fast=False
         )
 
-    if model_args.version == "v0":
+    if model_args.version == "v0": # skip
         if tokenizer.pad_token is None:
             smart_tokenizer_and_embedding_resize(
                 special_tokens_dict=dict(pad_token="[PAD]"),
                 tokenizer=tokenizer,
                 model=model,
             )
-    elif model_args.version == "v0.5":
+    elif model_args.version == "v0.5": # skip
         tokenizer.pad_token = tokenizer.unk_token
     else:
         tokenizer.pad_token = tokenizer.unk_token
         if model_args.version in conversation_lib.conv_templates:
             conversation_lib.default_conversation = conversation_lib.conv_templates[model_args.version]
-        else:
+        else: # skip
             conversation_lib.default_conversation = conversation_lib.conv_templates["vicuna_v1"]
 
     if model_args.vision_tower is not None:
@@ -850,8 +896,9 @@ def train():
         vision_tower.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
 
         data_args.image_processor = vision_tower.image_processor
+        # data_args.teacher_image_processor = teacher_image_processor
         data_args.is_multimodal = True
-
+        
         model.config.image_aspect_ratio = data_args.image_aspect_ratio
         model.config.image_grid_pinpoints = data_args.image_grid_pinpoints
 
@@ -861,18 +908,17 @@ def train():
         if not training_args.lora_enable:
             model.requires_grad_(True)
 
-        if model_args.tune_mm_mlp_adapter:
+        if model_args.tune_mm_mlp_adapter: # skip
             model.requires_grad_(False)
             for p in model.get_model().mm_projector.parameters():
                 p.requires_grad = True
 
         model.config.freeze_mm_mlp_adapter = training_args.freeze_mm_mlp_adapter
-        if training_args.freeze_mm_mlp_adapter:
+        if training_args.freeze_mm_mlp_adapter: # skip
             for p in model.get_model().mm_projector.parameters():
                 p.requires_grad = False
 
-
-        if training_args.bits in [4, 8]:
+        if training_args.bits in [4, 8]: # skip
             model.get_model().mm_projector.to(dtype=compute_dtype, device=training_args.device)
 
         model.config.mm_use_im_start_end = data_args.mm_use_im_start_end = model_args.mm_use_im_start_end
@@ -881,7 +927,7 @@ def train():
         model.config.mm_projector_lr = training_args.mm_projector_lr
         model.initialize_vision_tokenizer(model_args, tokenizer=tokenizer)
 
-    if training_args.bits in [4, 8]:
+    if training_args.bits in [4, 8]: # skip
         from peft.tuners.lora import LoraLayer
         for name, module in model.named_modules():
             if isinstance(module, LoraLayer):
@@ -893,11 +939,16 @@ def train():
                 if hasattr(module, 'weight'):
                     if training_args.bf16 and module.weight.dtype == torch.float32:
                         module = module.to(torch.bfloat16)
-
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
-    trainer = VLMTrainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
-
-    if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
+    if training_args.distill == 1:
+        trainer = VLMTrainer(model=model, teacher=teacher.eval(), tokenizer=tokenizer, args=training_args, **data_module)
+    else:
+        trainer = VLMTrainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
+    
+    # if training_args.task=='finetune' and training_args.distill == 1:
+    #     trainer.proj_adapter = torch.load('proj_adapter.pt').to(dtype=trainer.teacher.dtype,device=trainer.teacher.device)
+    #     trainer.attn_adapter = torch.load('attn_adapter.pt').to(dtype=trainer.teacher.dtype,device=trainer.teacher.device)
+    if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")): # skip
         trainer.train(resume_from_checkpoint=True)
     else:
         trainer.train()
@@ -919,7 +970,9 @@ def train():
             torch.save(non_lora_state_dict, os.path.join(training_args.output_dir, 'non_lora_trainables.bin'))
     else:
         safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
-
+    if training_args.distill==1:
+        torch.save(trainer.proj_adapter,'proj_adapter.pt')
+        torch.save(trainer.attn_adapter,'attn_adapter.pt')
 
 if __name__ == "__main__":
     train()

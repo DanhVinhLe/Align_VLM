@@ -126,3 +126,13 @@ work_dirs/
 outputs
 w
 
+*png
+*jpg
+*jpeg
+*bmp
+*gif
+
+venv-mobile/
+__pycache__/
+*.pyc
+*json
