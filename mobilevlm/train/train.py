@@ -630,8 +630,8 @@ class LazySupervisedDataset(Dataset):
             s for s in list_data_dict 
             if ('image' not in s) or os.path.exists(os.path.join(self.data_args.image_folder, s['image']))
         ]
+        # self.list_data_dict = self.list_data_dict[0:100]
         
-
     def __len__(self):
         return len(self.list_data_dict)
 

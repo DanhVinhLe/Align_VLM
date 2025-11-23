@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 from transformers import Trainer
 from typing import List, Optional
 from torch.utils.data import Sampler
@@ -7,7 +8,7 @@ from transformers.trainer import (ALL_LAYERNORM_LAYERS, ShardedDDPOption,
                                   is_sagemaker_mp_enabled, logger)
 from transformers.utils import is_sagemaker_mp_enabled, is_apex_available
 import torch.nn.functional as F
-from transformers.trainer_pt_utils import OSS
+# from transformers.trainer_pt_utils import OSS
 from transformers.modeling_utils import unwrap_model
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
@@ -19,6 +20,29 @@ try:
 except ImportError:
     pass
 import os
+
+class CKALoss(nn.Module):
+    """
+    Loss with knowledge distillation.
+    """
+    def __init__(self, eps ):
+        super().__init__()
+        self.eps = eps
+    def forward(self, SH, TH): 
+        dT = TH.size(-1)
+        dS = SH.size(-1)
+        SH = SH.view(-1,dS).to(SH.device,torch.float64)
+        TH = TH.view(-1,dT).to(SH.device,torch.float64)
+        
+        slen = SH.size(0)
+        SH = SH - SH.mean(0, keepdim=True)
+        TH = TH - TH.mean(0, keepdim=True)
+                
+        num = torch.norm(SH.t().matmul(TH),'fro')
+        den1 = torch.norm(SH.t().matmul(SH),'fro') + self.eps
+        den2 = torch.norm(TH.t().matmul(TH),'fro') + self.eps
+        
+        return 1 - num/torch.sqrt(den1*den2)
         
 def split_to_even_chunks(indices, lengths, num_chunks):
     """
@@ -142,6 +166,10 @@ class VLMTrainer(Trainer):
             ).to(device=teacher.device,dtype=teacher.dtype).train()
             self.proj_adapter = torch.nn.Sequential(
                 torch.nn.Conv1d(4096,2048,1),
+            ).to(device=teacher.device,dtype=teacher.dtype).train()
+            self.last_hidden_state_adapter = torch.nn.Sequential(
+                nn.Linear(4096, 2048),
+                nn.ReLU(),
             ).to(device=teacher.device,dtype=teacher.dtype).train()
         
     def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
@@ -325,16 +353,29 @@ class VLMTrainer(Trainer):
         if t_v_mask.sum(-2)[0,1]==True:
             top_idx = top_idx - 1
         else:
+            # print("forward here")
             top_idx = top_idx - 2
         batch_idx = torch.arange(top_idx.shape[0]).unsqueeze(-1).repeat(1,top_idx.shape[-1]).flatten()
         top_idx = top_idx.flatten()
-        v_feature_pick = v_feature[batch_idx,top_idx]
-        teacher_v_feature_pick = teacher_v_feature[batch_idx,top_idx]
-        v_loss = ((self.proj_adapter(teacher_v_feature_pick.unsqueeze(1).permute(0,2,1)) - v_feature_pick.unsqueeze(1).permute(0,2,1))**2).mean()
+        top_idx_student = top_idx.clamp(0, v_feature.shape[1]-1)
+        top_idx_teacher = top_idx.clamp(0, teacher_v_feature.shape[1]-1)
+        # print(f"Shape of top idx: {top_idx.shape}, Shape of batch idx: {batch_idx.shape}")
+        # print(f"shape of v feature: {v_feature.shape}, shape of teacher v feature: {teacher_v_feature.shape}")
+        v_feature_pick = v_feature[batch_idx,top_idx_student]
+        teacher_v_feature_pick = teacher_v_feature[batch_idx,top_idx_teacher]
+        teacher_proj = self.proj_adapter(teacher_v_feature_pick.unsqueeze(1).permute(0,2,1))[:, :, 0]
+        student_feat = v_feature_pick
+        
+        weights = top_attn / (top_attn.sum(dim=-1, keepdim=True) + 1e-8)
+        weights = weights.flatten()
+        mse_per_item = ((teacher_proj - student_feat)**2).mean(dim=-1)  # [B*k]
+        v_loss_weighted = (weights * mse_per_item).sum()
+        # v_loss = ((self.proj_adapter(teacher_v_feature_pick.unsqueeze(1).permute(0,2,1)) - v_feature_pick.unsqueeze(1).permute(0,2,1))**2).mean()
         v_loss_all = ((self.proj_adapter(teacher_v_feature.permute(0,2,1))-v_feature.permute(0,2,1))**2).mean()
-        v_loss = v_loss + v_loss_all
+        v_loss = v_loss_weighted + v_loss_all
         
         return v_loss
+    
     
     def compute_loss(self, model, inputs, return_outputs=False):
         """
@@ -352,14 +393,16 @@ class VLMTrainer(Trainer):
             idx = None
         else:
             idx = idx[0]
-        outputs, v_feature, front_attn, t_v_mask = model(**inputs) # dict loss, logits, hidden_states=None, attention=None  
+        outputs, v_feature, front_attn, t_v_mask, last_student_attn = model(**inputs) # dict loss, logits, hidden_states=None, attention=None  
         if self.args.distill == 1 and idx is not None:
             with torch.no_grad():
-                teacher_outputs, teacher_v_feature, teacher_front_attn, _ = self.teacher(**inputs)
+                teacher_outputs, teacher_v_feature, teacher_front_attn, t_v_mask_teacher, last_teacher_attn = self.teacher(**inputs)
                 teacher_logits = teacher_outputs['logits']
                 teacher_front_attn = teacher_front_attn
                 
-
+        # print(f"Shape of student front attn: {front_attn.shape}, Shape of teacher front attn: {teacher_front_attn.shape}" if idx is not None else "No distillation for this batch")
+        # print(f"Shape of student v feature: {v_feature.shape}, Shape of teacher v feature: {teacher_v_feature.shape}" if idx is not None else "No distillation for this batch")
+        # print(f"shape of t_v_mask: {t_v_mask.shape}" if idx is not None else "No distillation for this batch")
         # Save past state if it exists
         # TODO: this needs to be fixed and made cleaner later.
         if self.args.past_index >= 0:
@@ -391,9 +434,114 @@ class VLMTrainer(Trainer):
                     v_loss = ((self.proj_adapter(teacher_v_feature.permute(0,2,1))-v_feature.permute(0,2,1))**2).mean()
                 else:
                     v_loss = self.get_v_loss(teacher_front_attn, t_v_mask, v_feature, teacher_v_feature)
-                attn_loss = ((self.attn_adapter(teacher_front_attn) - front_attn)[t_v_mask!=0]**2).mean()
+                
+                teacher_mask_attn = t_v_mask_teacher[:,0,:,:].unsqueeze(1)
+                teacher_mask_attn = teacher_mask_attn.expand(-1,teacher_front_attn.shape[1],-1,-1)
+                student_mask_attn = t_v_mask[:,0,:,:].unsqueeze(1)
+                student_mask_attn = student_mask_attn.expand(-1,front_attn.shape[1],-1,-1)
 
-                loss = loss + v_logits_distill + v_loss + attn_loss
+                teacher_sub_attn = teacher_front_attn*teacher_mask_attn
+                front_sub_attn = front_attn*student_mask_attn
+                # print(f"Shape of teacher sub attn: {teacher_sub_attn.shape}, Shape of student sub attn: {front_sub_attn.shape}")
+                teacher_sub_attn = teacher_sub_attn.mean(1)
+                front_sub_attn = front_sub_attn.mean(1)
+                teacher_sub_attn = torch.where(
+                    teacher_sub_attn < 1e-3, 
+                    torch.zeros_like(teacher_sub_attn).to(teacher_sub_attn.device), 
+                    teacher_sub_attn
+                )
+                front_sub_attn = torch.where(
+                    front_sub_attn < 1e-3, 
+                    torch.zeros_like(front_sub_attn).to(front_sub_attn.device), 
+                    front_sub_attn
+                )
+                self.cka_loss_fn = CKALoss(eps=1e-8)
+                attn_loss = 0.0 
+                for i in range(teacher_sub_attn.shape[0]):
+                    attn_loss = attn_loss + self.cka_loss_fn(front_sub_attn[i], teacher_sub_attn[i])
+                # attn_loss = ((self.attn_adapter(teacher_front_attn) - front_attn)[t_v_mask!=0]**2).mean()
+                ot_loss = self.compute_ot_loss(outputs['hidden_states'], teacher_outputs['hidden_states'], last_student_attn, last_teacher_attn)
+                
+                loss = loss + v_logits_distill + v_loss + attn_loss + ot_loss
             torch.cuda.empty_cache()
 
         return (loss, outputs) if return_outputs else loss
+    
+    def compute_ot_loss(self, student_hidden, teacher_hidden, student_attn_matrix, teacher_attn_matrix):
+        batch_size, seq_len, hidden_size = student_hidden.size()
+        ot_loss = 0.0
+        for i in range(batch_size):
+            cost_matrix = self.pairwise_cosine_distance(student_hidden[i], self.last_hidden_state_adapter(teacher_hidden[i]))
+            student_attn = student_attn_matrix[i].mean(0).sum(0)
+            teacher_attn = teacher_attn_matrix[i].mean(0).sum(0)
+            # print(f"Shape of student attn: {student_attn.shape}, Shape of teacher attn: {teacher_attn.shape}")
+            student_importance = torch.softmax(student_attn, dim = 0)
+            teacher_importance = torch.softmax(teacher_attn, dim = 0)
+            student_importance = student_importance.view(-1, 1)
+            teacher_importance = teacher_importance.view(-1, 1)
+            ot_loss_batch, _ = self.sinkhorn(cost_matrix, student_importance, teacher_importance, num_iters=100)
+            ot_loss = ot_loss + ot_loss_batch
+        ot_loss = ot_loss / batch_size
+        return ot_loss
+            
+    def pairwise_euclidean_distance(self, x, y):
+        return torch.cdist(x, y, p=2)
+    
+    def pairwise_cosine_distance(self, a, b, eps=1e-8):
+        """
+        Computes pairwise cosine distance with numerical stability
+        """
+        a_n, b_n = a.norm(dim=1)[:, None], b.norm(dim=1)[:, None]
+        a_norm = a / torch.max(a_n, eps * torch.ones_like(a_n, dtype=a.dtype))
+        b_norm = b / torch.max(b_n, eps * torch.ones_like(b_n, dtype=b.dtype))
+        sim_mt = torch.mm(a_norm, b_norm.transpose(0, 1))
+        
+        sim_mt = 1 - sim_mt
+        return sim_mt
+    
+    def sinkhorn(self, cost_matrix, a, b, num_iters=None):
+        if num_iters is None:
+            num_iters = 100
+        
+        m, n = cost_matrix.shape
+        device = cost_matrix.device
+        dtype = cost_matrix.dtype
+        
+        if m == 0 or n == 0:
+            return torch.tensor(0.0, device=device, dtype=dtype), torch.zeros((m, n), device=device, dtype=dtype)
+        
+        if a.dim() == 1:
+            a = a.view(-1, 1)
+        if b.dim() == 1:
+            b = b.view(-1, 1)
+            
+        a = a.to(dtype=dtype)
+        b = b.to(dtype=dtype)
+        
+        if a.shape[0] != m:
+            a = torch.ones(m, 1, device=device, dtype=dtype) / m
+        if b.shape[0] != n:
+            b = torch.ones(n, 1, device=device, dtype=dtype) / n
+        
+        if torch.sum(a) < 1e-9 or torch.sum(b) < 1e-9:
+            a = torch.ones(m, 1, device=device, dtype=dtype) / m
+            b = torch.ones(n, 1, device=device, dtype=dtype) / n
+        else:
+            a = a / torch.sum(a)
+            b = b / torch.sum(b)       
+        K = torch.exp(-cost_matrix / 0.1)
+        u = torch.ones(m, 1, device=device, dtype=dtype)
+        v = torch.ones(n, 1, device=device, dtype=dtype)
+        
+        for _ in range(num_iters):
+            u_prev = u.clone()  
+            KTu = torch.matmul(K.t(), u)
+            v = b / (KTu + 1e-8)           
+            Kv = torch.matmul(K, v)
+            u = a / (Kv + 1e-8)        
+            err = torch.norm(u - u_prev, p=float('inf'))
+            if err < 1e-8:
+                break
+        P = torch.diag(u.squeeze()) @ K @ torch.diag(v.squeeze())
+        ot_loss = torch.sum(P * cost_matrix)
+        return ot_loss, P

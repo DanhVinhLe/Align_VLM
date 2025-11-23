@@ -1,5 +1,3 @@
-#!/usr/bin/env bash
-
 WORK_DIR=$(cd "$(dirname "$0")";pwd)
 export PYTHONPATH=${WORK_DIR}
 
@@ -12,8 +10,10 @@ case ${TASK} in
         mkdir -p ${OUTPUT_DIR}
         LANGUAGE_MODEL=$3
         VISION_MODEL=$4
-        bash run.sh ${ARCH} pretrain ${LANGUAGE_MODEL} ${VISION_MODEL} ${OUTPUT_DIR}
-        bash run.sh ${ARCH} finetune ${LANGUAGE_MODEL} ${VISION_MODEL} ${OUTPUT_DIR}
+			DATA_PATH=$5
+        DISTILL=$6
+        bash run.sh ${ARCH} pretrain ${LANGUAGE_MODEL} ${VISION_MODEL} ${OUTPUT_DIR} ${DATA_PATH} ${DISTILL}
+        bash run.sh ${ARCH} finetune ${LANGUAGE_MODEL} ${VISION_MODEL} ${OUTPUT_DIR} ${DATA_PATH} ${DISTILL}
         bash run.sh ${ARCH} test ${OUTPUT_DIR}/mobilevlm_v2-2.finetune
     ;;
     "pretrain")
@@ -22,14 +22,18 @@ case ${TASK} in
         LANGUAGE_MODEL=$3
         VISION_MODEL=$4
         OUTPUT_DIR=$5
+			DATA_PATH=$6
+			DISTILL=$7
         OUTPUT_DIR_PT=${OUTPUT_DIR}/mobilevlm_v2-1.pretrain
         mkdir -p ${OUTPUT_DIR_PT}
         deepspeed mobilevlm/train/train_mem.py \
+            --distill ${DISTILL} \
+            --task pretrain \
             --deepspeed scripts/deepspeed/zero2.json \
             --model_name_or_path ${LANGUAGE_MODEL} \
             --version plain \
-            --data_path data/pretrain_data/share-captioner_coco_lcs_sam_1246k_1107.json \
-            --image_folder data/pretrain_data \
+            --data_path ${DATA_PATH}/pretrain_data/share-captioner_coco_lcs_sam_1246k_1107.json \
+            --image_folder ${DATA_PATH}/pretrain_data \
             --vision_tower ${VISION_MODEL} \
             --vision_tower_type clip \
             --mm_projector_type ldpnetv2 \
@@ -40,19 +44,18 @@ case ${TASK} in
             --bf16 True \
             --output_dir ${OUTPUT_DIR_PT} \
             --num_train_epochs 1 \
-            --per_device_train_batch_size 32 \
+            --per_device_train_batch_size 1 \
             --per_device_eval_batch_size 4 \
-            --gradient_accumulation_steps 1 \
+            --gradient_accumulation_steps 32 \
             --evaluation_strategy "no" \
             --save_strategy "steps" \
-            --save_steps 24000 \
+            --save_steps 1600 \
             --save_total_limit 1 \
             --learning_rate 2e-5 \
             --weight_decay 0. \
             --warmup_ratio 0.03 \
             --lr_scheduler_type "cosine" \
-            --logging_steps 1 \
-            --tf32 True \
+            --logging_steps 5 \
             --model_max_length 2048 \
             --gradient_checkpointing True \
             --dataloader_num_workers 4 \
@@ -66,16 +69,20 @@ case ${TASK} in
         cd ${WORK_DIR}
         LANGUAGE_MODEL=$3
         VISION_MODEL=$4
-        OUTPUT_DIR=$5
+        OUTPUT_DIR=${WORK_DIR}/outputs/${ARCH}_$(date +"%Y%m%d_%H%M%S")
+			DATA_PATH=data
+			DISTILL=1
         OUTPUT_DIR_PT=${OUTPUT_DIR}/mobilevlm_v2-1.pretrain
         OUTPUT_DIR_FT=${OUTPUT_DIR}/mobilevlm_v2-2.finetune
         mkdir -p ${OUTPUT_DIR_FT}
         deepspeed mobilevlm/train/train_mem.py \
-            --deepspeed scripts/deepspeed/zero3.json \
-            --model_name_or_path ${OUTPUT_DIR_PT} \
+            --distill ${DISTILL} \
+            --task finetune \
+            --deepspeed scripts/deepspeed/zero2.json \
+            --model_name_or_path mtgv/MobileVLM_V2-1.7B \
             --version v1 \
-            --data_path data/finetune_data/MobileVLM_V2_FT_Mix2M.json \
-            --image_folder data/finetune_data \
+            --data_path ${DATA_PATH}/finetune_data/MobileVLM_V2_FT_Mix2M.json \
+            --image_folder ${DATA_PATH}/finetune_data \
             --vision_tower ${VISION_MODEL} \
             --vision_tower_type clip \
             --mm_projector_type ldpnetv2 \
@@ -87,19 +94,18 @@ case ${TASK} in
             --bf16 True \
             --output_dir ${OUTPUT_DIR_FT} \
             --num_train_epochs 1 \
-            --per_device_train_batch_size 16 \
+            --per_device_train_batch_size 1 \
             --per_device_eval_batch_size 4 \
-            --gradient_accumulation_steps 1 \
+            --gradient_accumulation_steps 4 \
             --evaluation_strategy "no" \
             --save_strategy "steps" \
-            --save_steps 2000 \
+            --save_steps 1000 \
             --save_total_limit 1 \
             --learning_rate 4e-5 \
             --weight_decay 0. \
             --warmup_ratio 0.03 \
             --lr_scheduler_type "cosine" \
-            --logging_steps 1 \
-            --tf32 True \
+            --logging_steps 5 \
             --model_max_length 2048 \
             --gradient_checkpointing True \
             --dataloader_num_workers 4 \
@@ -119,19 +125,22 @@ case ${TASK} in
         cd ${WORK_DIR}
         LANGUAGE_MODEL=$3
         VISION_MODEL=$4
-        OUTPUT_DIR=$5
-        OUTPUT_DIR_PT=${OUTPUT_DIR}/mobilevlm_v2-1.pretrain
+        OUTPUT_DIR=${WORK_DIR}/outputs/${ARCH}_$(date +"%Y%m%d_%H%M%S")
+			DATA_PATH=data
+			DISTILL=1
+        OUTPUT_DIR_PT=mtgv/MobileVLM_V2-1.7B
         OUTPUT_DIR_FT=${OUTPUT_DIR}/mobilevlm_v2-2.finetune-lora
         mkdir -p ${OUTPUT_DIR_FT}
         declare -A DS_CONF
         deepspeed mobilevlm/train/train_mem.py \
-            --deepspeed scripts/deepspeed/zero3.json \
+            --distill ${DISTILL} \
+            --deepspeed scripts/deepspeed/zero2.json \
             --lora_enable True --lora_r 128 --lora_alpha 256 \
             --learning_rate 2e-4 \
-            --model_name_or_path ${OUTPUT_DIR_PT} \
+            --model_name_or_path mtgv/MobileVLM_V2-1.7B \
             --version v1 \
-            --data_path data/finetune_data/MobileVLM_V2_FT_Mix2M.json \
-            --image_folder data/finetune_data \
+            --data_path ${DATA_PATH}/finetune_data/MobileVLM_V2_FT_Mix2M.json \
+            --image_folder ${DATA_PATH}/finetune_data \
             --vision_tower ${VISION_MODEL} \
             --vision_tower_type clip \
             --mm_projector_type ldpnetv2 \
@@ -143,9 +152,9 @@ case ${TASK} in
             --bf16 True \
             --output_dir ${OUTPUT_DIR_FT} \
             --num_train_epochs 1 \
-            --per_device_train_batch_size 16 \
+            --per_device_train_batch_size 4 \
             --per_device_eval_batch_size 4 \
-            --gradient_accumulation_steps 1 \
+            --gradient_accumulation_steps 4 \
             --evaluation_strategy "no" \
             --save_strategy "steps" \
             --save_steps 50000 \
@@ -154,7 +163,6 @@ case ${TASK} in
             --warmup_ratio 0.03 \
             --lr_scheduler_type "cosine" \
             --logging_steps 1 \
-            --tf32 True \
             --model_max_length 2048 \
             --gradient_checkpointing True \
             --dataloader_num_workers 4 \
@@ -167,4 +175,5 @@ case ${TASK} in
     ;;
     *)
         echo "error with ${DATASET_ID}"
+    ;;
 esac

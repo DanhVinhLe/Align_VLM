@@ -172,7 +172,7 @@ class MobileVLMMetaForCausalLM(ABC):
 
         text_mask,vision_mask=None,None
         if any(x.shape != new_input_embeds[0].shape for x in new_input_embeds):
-            print("Forward with padding for different lengths of input_embeds.")
+            # print("Forward with padding for different lengths of input_embeds.")
             max_len = max(x.shape[0] for x in new_input_embeds)
 
             new_input_embeds_align = []
@@ -199,7 +199,7 @@ class MobileVLMMetaForCausalLM(ABC):
                 attention_mask = torch.stack(new_attention_mask, dim=0)
                 assert attention_mask.shape == new_labels.shape
         else:
-            print("Forward without padding for same lengths of input_embeds.")
+            # print("Forward without padding for same lengths of input_embeds.")
             new_input_embeds = torch.stack(new_input_embeds, dim=0)
             if labels is not None:
                 new_labels  = torch.stack(new_labels, dim=0)
