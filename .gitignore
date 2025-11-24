@@ -103,8 +103,6 @@ venv.bak/
 
 # mypy
 .mypy_cache/
-data/
-data
 .vscode
 .idea
 .DS_Store
@@ -120,7 +118,6 @@ work_dirs/
 # Pytorch
 *.pth
 *.py~
-*.sh~
 
 # MobileVLM
 outputs

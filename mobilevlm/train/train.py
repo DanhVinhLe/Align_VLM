@@ -971,8 +971,9 @@ def train():
     else:
         safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
     if training_args.distill==1:
-        torch.save(trainer.proj_adapter,'proj_adapter.pt')
-        torch.save(trainer.attn_adapter,'attn_adapter.pt')
+        # torch.save(trainer.proj_adapter,'proj_adapter.pt')
+        # torch.save(trainer.attn_adapter,'attn_adapter.pt')
+        pass
 
 if __name__ == "__main__":
     train()
