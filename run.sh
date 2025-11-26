@@ -72,7 +72,7 @@ case ${TASK} in
         OUTPUT_DIR=${WORK_DIR}/outputs/${ARCH}_$(date +"%Y%m%d_%H%M%S")
 			DATA_PATH=data
 			DISTILL=1
-        OUTPUT_DIR_PT=${OUTPUT_DIR}/mobilevlm_v2-1.pretrain
+        OUTPUT_DIR_PT=mtgv/MobileVLM_V2-1.7B
         OUTPUT_DIR_FT=${OUTPUT_DIR}/mobilevlm_v2-2.finetune
         mkdir -p ${OUTPUT_DIR_FT}
         deepspeed mobilevlm/train/train_mem.py \
@@ -94,9 +94,9 @@ case ${TASK} in
             --bf16 True \
             --output_dir ${OUTPUT_DIR_FT} \
             --num_train_epochs 1 \
-            --per_device_train_batch_size 1 \
+            --per_device_train_batch_size 4 \
             --per_device_eval_batch_size 4 \
-            --gradient_accumulation_steps 4 \
+            --gradient_accumulation_steps 16 \
             --evaluation_strategy "no" \
             --save_strategy "steps" \
             --save_steps 1000 \
