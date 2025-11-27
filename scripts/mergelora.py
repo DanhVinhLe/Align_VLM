@@ -16,7 +16,7 @@ def merge_lora(model_base, model_path, save_path):
     lora_cfg_pretrained = AutoConfig.from_pretrained(model_path)
     tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
     # Loading weight from base model
-    model = MobileLlamaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=lora_cfg_pretrained, **kwargs)
+    model = MobileLlamaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=False, config=lora_cfg_pretrained, torch_dtype=torch.bfloat16)
     print("🔜 Don't worry, we will load vision-tower weight soon later...")
     token_num, tokem_dim = model.lm_head.out_features, model.lm_head.in_features
     if model.lm_head.weight.shape[0] != token_num:
@@ -42,7 +42,7 @@ def merge_lora(model_base, model_path, save_path):
     vision_tower = model.get_vision_tower()
     if not vision_tower.is_loaded:
         vision_tower.load_model()
-    vision_tower.to(device=model.device, dtype=torch.float16)
+    vision_tower.to(device=model.device, dtype=torch.bfloat16)
     print("✅ The vision-tower is loaded successful!")
     # save
     model.save_pretrained(save_path)
