@@ -43,6 +43,7 @@ def process_images(images, image_processor, model_cfg):
         for image in images:
             image = expand2square(image, tuple(int(x*255) for x in image_processor.image_mean))
             image = image_processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+            # print(f"Processed image shape: {image.shape}")
             new_images.append(image)
     else:
         return image_processor(images, return_tensors='pt')['pixel_values']

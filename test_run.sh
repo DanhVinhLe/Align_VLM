@@ -16,7 +16,7 @@ echo ">>> Start Fine-tuning with LoRA ..."
 deepspeed mobilevlm/train/train_mem.py \
     --distill ${DISTILL} \
     --deepspeed scripts/deepspeed/zero2.json \
-    --lora_enable True --lora_r 128 --lora_alpha 256 \
+    --lora_enable True --lora_r 64 --lora_alpha 128 \
     --learning_rate 2e-4 \
     --model_name_or_path mtgv/MobileVLM_V2-1.7B \
     --version v1 \
@@ -33,9 +33,9 @@ deepspeed mobilevlm/train/train_mem.py \
     --bf16 True \
     --output_dir ${OUTPUT_DIR_FT} \
     --num_train_epochs 1 \
-    --per_device_train_batch_size 4 \
-    --per_device_eval_batch_size 4 \
-    --gradient_accumulation_steps 16 \
+    --per_device_train_batch_size 1 \
+    --per_device_eval_batch_size 1 \
+    --gradient_accumulation_steps 4 \
     --evaluation_strategy "no" \
     --save_strategy "steps" \
     --save_steps 50000 \

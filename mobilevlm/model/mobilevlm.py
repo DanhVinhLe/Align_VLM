@@ -12,7 +12,7 @@ class MobileVLMMetaModel:
     def __init__(self, config):
         super(MobileVLMMetaModel, self).__init__(config)
         if hasattr(config, "mm_vision_tower"):  
-            self.vision_tower = build_vision_tower(config, delay_load=True)
+            self.vision_tower = build_vision_tower(config, delay_load=False)
             self.mm_projector = build_vision_projector(config)
 
     def get_vision_tower(self):
@@ -54,7 +54,7 @@ class MobileVLMMetaModel:
         self.config.mm_vision_select_layer = mm_vision_select_layer
         self.config.mm_vision_select_feature = mm_vision_select_feature
         # Build VisionTower
-        vision_tower = build_vision_tower(model_args)
+        # vision_tower = build_vision_tower(model_args)
         if fsdp is not None and len(fsdp) > 0:
             self.vision_tower = [vision_tower]
         else:
@@ -70,7 +70,7 @@ class MobileVLMMetaModel:
             mm_projector_weights = torch.load(pretrain_mm_mlp_adapter, map_location='cpu')
             def get_w(weights, keyword):
                 return {k.split(keyword + '.')[1]: v for k, v in weights.items() if keyword in k}
-            self.mm_projector.load_state_dict(get_w(mm_projector_weights, 'mm_projector'))
+            self.mm_projector.load_state_dict(get_w(mm_projector_weights, 'mm_projector'), assign=True)
 
 
 class MobileVLMMetaForCausalLM(ABC):
@@ -267,7 +267,7 @@ class MobileVLMMetaForCausalLM(ABC):
                     p.requires_grad = False
 
 
-def load_pretrained_model(model_path, load_8bit=False, load_4bit=False, device_map="auto", device="cuda"):
+def load_pretrained_model(model_path, load_8bit=False, load_4bit=False, device_map="cuda", device="cuda"):
 
     from mobilevlm.model.mobilellama import MobileLlamaForCausalLM
 
@@ -279,16 +279,15 @@ def load_pretrained_model(model_path, load_8bit=False, load_4bit=False, device_m
         kwargs['load_in_4bit'] = True
         kwargs['quantization_config'] = BitsAndBytesConfig(
             load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_compute_dtype=torch.bfloat16,
             bnb_4bit_use_double_quant=True,
             bnb_4bit_quant_type='nf4'
         )
     else:
-        kwargs['torch_dtype'] = torch.float16
+        kwargs['torch_dtype'] = torch.bfloat16
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
     model = MobileLlamaForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, **kwargs)
-
     mm_use_im_start_end = getattr(model.config, "mm_use_im_start_end", False)
     mm_use_im_patch_token = getattr(model.config, "mm_use_im_patch_token", True)
     if mm_use_im_patch_token:
@@ -302,7 +301,7 @@ def load_pretrained_model(model_path, load_8bit=False, load_4bit=False, device_m
         vision_tower.load_image_processor()
     elif not vision_tower.is_loaded:
         vision_tower.load_model()
-    vision_tower.to(device=device, dtype=torch.float16)
+    vision_tower.to(device=device, dtype=torch.bfloat16)
     image_processor = vision_tower.image_processor
 
     if hasattr(model.config, "max_sequence_length"):
@@ -312,7 +311,7 @@ def load_pretrained_model(model_path, load_8bit=False, load_4bit=False, device_m
     
     return tokenizer, model, image_processor, context_len
 
-def load_pretrained_model_processor(model_path, load_8bit=False, load_4bit=False, device_map="auto", device="cuda"):
+def load_pretrained_model_processor(model_path, load_8bit=False, load_4bit=False, device_map="cuda", device="cuda"):
 
     from mobilevlm.model.mobilellama import MobileLlamaForCausalLM
 
@@ -324,12 +323,12 @@ def load_pretrained_model_processor(model_path, load_8bit=False, load_4bit=False
         kwargs['load_in_4bit'] = True
         kwargs['quantization_config'] = BitsAndBytesConfig(
             load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_compute_dtype=torch.bfloat16,
             bnb_4bit_use_double_quant=True,
             bnb_4bit_quant_type='nf4'
         )
     else:
-        kwargs['torch_dtype'] = torch.float16
+        kwargs['torch_dtype'] = torch.bfloat16
 
     model = MobileLlamaForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, **kwargs)
 
@@ -339,7 +338,7 @@ def load_pretrained_model_processor(model_path, load_8bit=False, load_4bit=False
     elif not vision_tower.is_loaded:
         vision_tower.load_model()
         
-    vision_tower.to(device=device, dtype=torch.float16)
+    vision_tower.to(device=device, dtype=torch.bfloat16)
     image_processor = vision_tower.image_processor
     
     return model, image_processor
